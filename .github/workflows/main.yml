@@ -1,10 +1,10 @@
-name: Kernel Build (zyc clang)
+name: Kernel Build (zyc clang, coresight-safe, verbose log)
 
 on:
   workflow_dispatch:
     inputs:
       zyc_clang_url:
-        description: 'URL to zyc clang archive (tar.xz or zip). Leave empty to use ZYC_CLANG_URL secret/env.'
+        description: 'URL to zyc clang archive (tar.xz or zip). Leave empty to use repo secret ZYC_CLANG_URL.'
         required: false
       defconfig:
         description: 'Kernel defconfig (default: defconfig)'
@@ -14,10 +14,15 @@ on:
         description: 'Number of parallel jobs (optional)'
         required: false
         default: ''
+      coresight_mode:
+        description: "How to treat CORESIGHT options: keep | module | disable (default: module)"
+        required: false
+        default: module
 
 env:
   NAME: RezzzzFy
   OUTDIR: out
+  # fallback to secret if not provided via dispatch
   ZYC_CLANG_URL: ${{ github.event.inputs.zyc_clang_url || secrets.ZYC_CLANG_URL || '' }}
 
 jobs:
@@ -35,12 +40,14 @@ jobs:
           echo "DEFCONFIG=${{ github.event.inputs.defconfig }}"
           echo "ZYC_CLANG_URL=${{ env.ZYC_CLANG_URL }}"
           echo "JOBS=${{ github.event.inputs.jobs_runners }}"
+          echo "CORESIGHT_MODE=${{ github.event.inputs.coresight_mode }}"
 
       - name: Install build dependencies (robust)
         run: |
           set -euo pipefail
           sudo apt-get update
 
+          # ensure add-apt-repository exists to enable universe if needed
           sudo apt-get install -y --no-install-recommends software-properties-common || true
           sudo add-apt-repository -y universe || true
           sudo apt-get update
@@ -51,6 +58,7 @@ jobs:
 
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends $DEPS || true
 
+          # Robust handling for distutils (several possible package names)
           if ! dpkg -s python3-distutils >/dev/null 2>&1; then
             echo "python3-distutils not found, trying alternatives..."
             if sudo apt-get install -y python3-distutils 2>/dev/null; then
@@ -68,18 +76,19 @@ jobs:
             echo "python3-distutils already installed"
           fi
 
+          # Optional: ccache dir
           mkdir -p $HOME/.ccache
+        shell: bash
 
-      - name: Download & extract zyc clang
+      - name: Download & extract zyc clang (if provided)
         if: env.ZYC_CLANG_URL != ''
         run: |
+          set -euo pipefail
           TOOLSDIR=$(pwd)/toolchains
           mkdir -p "${TOOLSDIR}"
           ARCHIVE="${TOOLSDIR}/zycclang_archive"
-
           echo "Downloading ZYC clang from: ${ZYC_CLANG_URL}"
           curl -L --retry 5 -o "${ARCHIVE}" "${ZYC_CLANG_URL}"
-
           file "${ARCHIVE}" || true
           if file "${ARCHIVE}" | grep -q "XZ compressed"; then
             tar -xJf "${ARCHIVE}" -C "${TOOLSDIR}"
@@ -88,48 +97,120 @@ jobs:
           elif file "${ARCHIVE}" | grep -q "Zip archive data"; then
             unzip -q "${ARCHIVE}" -d "${TOOLSDIR}"
           else
-            echo "Unknown format, trying tar -xf"
+            echo "Unknown archive format; attempting tar -xf"
             tar -xf "${ARCHIVE}" -C "${TOOLSDIR}" || true
           fi
-
-          echo "Extracted toolchains:"
+          echo "Toolchains extracted to ${TOOLSDIR}:"
           ls -la "${TOOLSDIR}"
+        shell: bash
 
-      - name: Setup PATH to zyc clang
+      - name: Setup PATH to zyc clang (auto-detect)
         if: env.ZYC_CLANG_URL != ''
         run: |
           TOOLSDIR=$(pwd)/toolchains
+          # find a directory that contains bin/clang or clang binary
           CLANG_DIR=$(find "${TOOLSDIR}" -type f -name clang -printf '%h\n' | head -n1 || true)
-
           if [ -z "${CLANG_DIR}" ]; then
-            echo "ERROR: clang not found!"
+            echo "ERROR: clang binary not found under ${TOOLSDIR}"
             ls -R "${TOOLSDIR}"
             exit 1
           fi
-
           echo "Found clang in: ${CLANG_DIR}"
-          echo "export ZYC_CLANG_DIR=${CLANG_DIR}" >> $GITHUB_ENV
-          echo "export PATH=${CLANG_DIR}:$PATH" >> $GITHUB_ENV
+          echo "ZYC_CLANG_DIR=${CLANG_DIR}" >> $GITHUB_ENV
+          echo "PATH=${CLANG_DIR}:$PATH" >> $GITHUB_ENV
+        shell: bash
 
-      - name: Print toolchain info
+      - name: Print toolchain info (best-effort)
         run: |
+          echo "clang --version:"
           clang --version || true
+          echo "ld.lld --version:"
           ld.lld --version || true
+          echo "aarch64-linux-gnu-gcc --version:"
           aarch64-linux-gnu-gcc --version || true
+        shell: bash
+
+      - name: Apply CORESIGHT config adjustments (keep/module/disable)
+        run: |
+          set -euo pipefail
+          MODE="${{ github.event.inputs.coresight_mode }}"
+          echo "Applying CORESIGHT mode: ${MODE}"
+
+          # ensure scripts/config exists and is executable, otherwise use sed fallback
+          if [ -x scripts/config ]; then
+            chmod +x scripts/config
+            case "$MODE" in
+              keep)
+                echo "Keeping existing CORESIGHT settings"
+                ;;
+              module)
+                echo "Converting selected CORESIGHT options to modules"
+                scripts/config --module CORESIGHT_TGU || true
+                scripts/config --module CORESIGHT_DUMMY || true
+                scripts/config --module CORESIGHT_REMOTE_ETM || true
+                scripts/config --disable CORESIGHT_REMOTE_ETM_DEFAULT_ENABLE || true
+                ;;
+              disable)
+                echo "Disabling selected CORESIGHT options"
+                scripts/config --disable CORESIGHT_TGU || true
+                scripts/config --disable CORESIGHT_DUMMY || true
+                scripts/config --disable CORESIGHT_REMOTE_ETM || true
+                scripts/config --disable CORESIGHT_REMOTE_ETM_DEFAULT_ENABLE || true
+                ;;
+              *)
+                echo "Unknown mode: ${MODE}, defaulting to module"
+                scripts/config --module CORESIGHT_TGU || true
+                scripts/config --module CORESIGHT_DUMMY || true
+                scripts/config --module CORESIGHT_REMOTE_ETM || true
+                scripts/config --disable CORESIGHT_REMOTE_ETM_DEFAULT_ENABLE || true
+                ;;
+            esac
+          else
+            echo "scripts/config not found — using sed fallback on .config (if present)"
+            if [ -f .config ]; then
+              if [ "$MODE" = "disable" ]; then
+                sed -i 's/CONFIG_CORESIGHT_TGU=.*/# CONFIG_CORESIGHT_TGU is not set/' .config || true
+                sed -i 's/CONFIG_CORESIGHT_DUMMY=.*/# CONFIG_CORESIGHT_DUMMY is not set/' .config || true
+                sed -i 's/CONFIG_CORESIGHT_REMOTE_ETM=.*/# CONFIG_CORESIGHT_REMOTE_ETM is not set/' .config || true
+                sed -i 's/CONFIG_CORESIGHT_REMOTE_ETM_DEFAULT_ENABLE=.*/# CONFIG_CORESIGHT_REMOTE_ETM_DEFAULT_ENABLE is not set/' .config || true
+              else
+                # module fallback
+                sed -i 's/CONFIG_CORESIGHT_TGU=.*/CONFIG_CORESIGHT_TGU=m/' .config || true
+                sed -i 's/CONFIG_CORESIGHT_DUMMY=.*/CONFIG_CORESIGHT_DUMMY=m/' .config || true
+                sed -i 's/CONFIG_CORESIGHT_REMOTE_ETM=.*/CONFIG_CORESIGHT_REMOTE_ETM=m/' .config || true
+                sed -i 's/CONFIG_CORESIGHT_REMOTE_ETM_DEFAULT_ENABLE=.*/# CONFIG_CORESIGHT_REMOTE_ETM_DEFAULT_ENABLE is not set/' .config || true
+              fi
+            else
+              echo ".config not found — skipping sed fallback"
+            fi
+          fi
+
+          # regenerate minimal .config if make target exists
+          if make help >/dev/null 2>&1; then
+            JOBS=${{ github.event.inputs.jobs_runners }}
+            if [ -z "$JOBS" ]; then JOBS=$(nproc); fi
+            make ARCH=arm64 O=${OUTDIR} olddefconfig || true
+          fi
+        shell: bash
 
       - name: Configure build (defconfig)
         run: |
+          set -euo pipefail
           export PATH=${ZYC_CLANG_DIR:-/usr/bin}:$PATH
           JOBS=${{ github.event.inputs.jobs_runners }}
           if [ -z "$JOBS" ]; then JOBS=$(nproc); fi
 
           mkdir -p "${OUTDIR}"
-          make ARCH=arm64 O=${OUTDIR} \
-            ${{ github.event.inputs.defconfig || env.DEFCONFIG }}
+          echo "Running defconfig: ${{ github.event.inputs.defconfig || env.DEFCONFIG }}"
+          make ARCH=arm64 O=${OUTDIR} ${{ github.event.inputs.defconfig || env.DEFCONFIG }}
+        shell: bash
+        env:
+          ZYC_CLANG_DIR: ${{ env.ZYC_CLANG_DIR }}
 
-      - name: Build kernel with zyc clang
+      - name: Build kernel with zyc clang (verbose, capture exit code)
         run: |
-          set -euo pipefail
+          # Note: we intentionally do NOT exit on make failure so that we can upload logs/artifacts
+          set -uo pipefail
           export PATH=${ZYC_CLANG_DIR:-/usr/bin}:$PATH
           export CC=clang
           export LD=ld.lld
@@ -140,19 +221,37 @@ jobs:
           JOBS=${{ github.event.inputs.jobs_runners }}
           if [ -z "$JOBS" ]; then JOBS=$(nproc); fi
 
-          make -j"$JOBS" ARCH=arm64 O=${OUTDIR} \
-            CC=$CC LD=$LD CLANG_TRIPLE=$CLANG_TRIPLE CROSS_COMPILE=$CROSS_COMPILE \
-            Image.gz-dtb \
-            || (tail -n 200 ${OUTDIR}/.config || true; exit 1)
+          echo "Building with: CC=$CC LD=$LD CLANG_TRIPLE=$CLANG_TRIPLE CROSS_COMPILE=$CROSS_COMPILE"
+          # Run make with verbose output, tee to build.log, capture make exit code
+          # Use bash PIPESTATUS to record the make exit status
+          bash -c 'make -j"'"$JOBS"'" ARCH=arm64 O="'"${OUTDIR}"'" CC="'"$CC"'" LD="'"$LD"'" CLANG_TRIPLE="'"$CLANG_TRIPLE"'" CROSS_COMPILE="'"$CROSS_COMPILE"'" V=1 Image.gz-dtb 2>&1 | tee build.log; echo ${PIPESTATUS[0]} > build_exit_code'
+        shell: bash
+        env:
+          ZYC_CLANG_DIR: ${{ env.ZYC_CLANG_DIR }}
 
-      - name: List output
+      - name: List output & basic artifacts
         run: |
-          ls -la ${OUTDIR}
+          echo "Listing ${OUTDIR}:"
+          ls -la ${OUTDIR} || true
+          echo "Top of build.log (if exists):"
+          if [ -f build.log ]; then
+            head -n 200 build.log || true
+          fi
+        shell: bash
 
-      - name: Upload kernel artifact
+      - name: Upload build log
         uses: actions/upload-artifact@v4
         with:
-          name: kernel-${{ env.NAME }}-build
+          name: kernel-build-log
+          path: |
+            build.log
+            build_exit_code
+
+      - name: Upload kernel artifacts (if produced)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-artifacts
           path: |
             ${OUTDIR}/Image*
             ${OUTDIR}/*.img
@@ -160,3 +259,22 @@ jobs:
             ${OUTDIR}/*.gz
             ${OUTDIR}/*.zip
             ${OUTDIR}/modules.tar.gz
+          # allow empty uploads so step doesn't fail if not present
+          if-no-files-found: ignore
+
+      - name: Fail job if build failed
+        if: always()
+        run: |
+          if [ -f build_exit_code ]; then
+            CODE=$(cat build_exit_code || echo 0)
+          else
+            CODE=0
+          fi
+          echo "Recorded build exit code: $CODE"
+          if [ "$CODE" -ne 0 ]; then
+            echo "Build failed with code $CODE — failing job after uploading logs/artifacts."
+            exit $CODE
+          else
+            echo "Build succeeded."
+          fi
+        shell: bash
