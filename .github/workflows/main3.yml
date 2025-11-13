@@ -1,4 +1,4 @@
-name: Kernel Build 4.19
+name: Kernel Build 4.19 noh
 
 on:
   workflow_dispatch:
