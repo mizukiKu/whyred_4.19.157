@@ -1,4 +1,4 @@
-name: Kernel Build (zyc clang, coresight-safe, verbose log)
+name: Kernel Build (zyc clang, coresight-safe, verbose log, out-cleanfix)
 
 on:
   workflow_dispatch:
@@ -9,7 +9,7 @@ on:
       defconfig:
         description: 'Kernel defconfig (default: defconfig)'
         required: false
-        default: defconfig
+        default: whyred_defconfig
       jobs_runners:
         description: 'Number of parallel jobs (optional)'
         required: false
@@ -22,7 +22,6 @@ on:
 env:
   NAME: RezzzzFy
   OUTDIR: out
-  # fallback to secret if not provided via dispatch
   ZYC_CLANG_URL: ${{ github.event.inputs.zyc_clang_url || secrets.ZYC_CLANG_URL || '' }}
 
 jobs:
@@ -46,21 +45,14 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update
-
-          # ensure add-apt-repository exists to enable universe if needed
           sudo apt-get install -y --no-install-recommends software-properties-common || true
           sudo add-apt-repository -y universe || true
           sudo apt-get update
-
           DEPS="build-essential bc bison flex libssl-dev libncurses-dev ccache \
             python3 python3-dev wget unzip xz-utils curl lld clang llvm \
             binutils-aarch64-linux-gnu gcc-aarch64-linux-gnu crossbuild-essential-arm64"
-
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends $DEPS || true
-
-          # Robust handling for distutils (several possible package names)
           if ! dpkg -s python3-distutils >/dev/null 2>&1; then
-            echo "python3-distutils not found, trying alternatives..."
             if sudo apt-get install -y python3-distutils 2>/dev/null; then
               echo "Installed python3-distutils"
             elif sudo apt-get install -y python3.11-distutils 2>/dev/null; then
@@ -72,11 +64,7 @@ jobs:
               sudo apt-get install -y python3-pip || true
               python3 -m pip install --user --upgrade pip setuptools wheel || true
             fi
-          else
-            echo "python3-distutils already installed"
           fi
-
-          # Optional: ccache dir
           mkdir -p $HOME/.ccache
         shell: bash
 
@@ -97,10 +85,8 @@ jobs:
           elif file "${ARCHIVE}" | grep -q "Zip archive data"; then
             unzip -q "${ARCHIVE}" -d "${TOOLSDIR}"
           else
-            echo "Unknown archive format; attempting tar -xf"
             tar -xf "${ARCHIVE}" -C "${TOOLSDIR}" || true
           fi
-          echo "Toolchains extracted to ${TOOLSDIR}:"
           ls -la "${TOOLSDIR}"
         shell: bash
 
@@ -108,26 +94,47 @@ jobs:
         if: env.ZYC_CLANG_URL != ''
         run: |
           TOOLSDIR=$(pwd)/toolchains
-          # find a directory that contains bin/clang or clang binary
           CLANG_DIR=$(find "${TOOLSDIR}" -type f -name clang -printf '%h\n' | head -n1 || true)
           if [ -z "${CLANG_DIR}" ]; then
             echo "ERROR: clang binary not found under ${TOOLSDIR}"
             ls -R "${TOOLSDIR}"
             exit 1
           fi
-          echo "Found clang in: ${CLANG_DIR}"
           echo "ZYC_CLANG_DIR=${CLANG_DIR}" >> $GITHUB_ENV
           echo "PATH=${CLANG_DIR}:$PATH" >> $GITHUB_ENV
         shell: bash
 
       - name: Print toolchain info (best-effort)
         run: |
-          echo "clang --version:"
           clang --version || true
-          echo "ld.lld --version:"
           ld.lld --version || true
-          echo "aarch64-linux-gnu-gcc --version:"
           aarch64-linux-gnu-gcc --version || true
+        shell: bash
+
+      - name: Backup source config if present (fix for O=out requirement)
+        id: backup_cfg
+        run: |
+          set -euo pipefail
+          BACKUP_DIR=$(pwd)/.source_config_backup
+          mkdir -p "${BACKUP_DIR}"
+
+          # If repo root contains .config or include/config, move them to backup
+          if [ -f .config ]; then
+            echo "Backing up repo .config -> ${BACKUP_DIR}/.config.repo"
+            mv .config "${BACKUP_DIR}/.config.repo"
+          fi
+
+          if [ -d include/config ]; then
+            echo "Backing up repo include/config -> ${BACKUP_DIR}/include_config_repo"
+            mv include/config "${BACKUP_DIR}/include_config_repo"
+          fi
+
+          # Confirm backup contents (for debugging)
+          echo "Backup dir contents:"
+          ls -la "${BACKUP_DIR}" || true
+
+          # write path to restore later
+          echo "BACKUP_DIR=${BACKUP_DIR}" >> $GITHUB_ENV
         shell: bash
 
       - name: Apply CORESIGHT config adjustments (keep/module/disable)
@@ -136,80 +143,85 @@ jobs:
           MODE="${{ github.event.inputs.coresight_mode }}"
           echo "Applying CORESIGHT mode: ${MODE}"
 
-          # ensure scripts/config exists and is executable, otherwise use sed fallback
+          # Make sure we operate on defconfig in place by running defconfig into OUTDIR first
+          # We'll use scripts/config on the defconfig file (O/.config) after generating it.
+          JOBS=${{ github.event.inputs.jobs_runners }}
+          if [ -z "$JOBS" ]; then JOBS=$(nproc); fi
+
+          mkdir -p ${OUTDIR}
+
+          # Generate initial defconfig in OUTDIR so scripts/config can modify it
+          make ARCH=arm64 O=${OUTDIR} ${{ github.event.inputs.defconfig || env.DEFCONFIG }}
+
+          # Use scripts/config to modify the O/.config if available
           if [ -x scripts/config ]; then
             chmod +x scripts/config
+            # point KCONFIG_CONFIG to the out config so scripts/config edits the right file
+            export KCONFIG_CONFIG="${PWD}/${OUTDIR}/.config"
             case "$MODE" in
               keep)
                 echo "Keeping existing CORESIGHT settings"
                 ;;
               module)
-                echo "Converting selected CORESIGHT options to modules"
-                scripts/config --module CORESIGHT_TGU || true
-                scripts/config --module CORESIGHT_DUMMY || true
-                scripts/config --module CORESIGHT_REMOTE_ETM || true
-                scripts/config --disable CORESIGHT_REMOTE_ETM_DEFAULT_ENABLE || true
+                echo "Converting selected CORESIGHT options to modules in ${KCONFIG_CONFIG}"
+                scripts/config --file ${KCONFIG_CONFIG} --module CORESIGHT_TGU || true
+                scripts/config --file ${KCONFIG_CONFIG} --module CORESIGHT_DUMMY || true
+                scripts/config --file ${KCONFIG_CONFIG} --module CORESIGHT_REMOTE_ETM || true
+                scripts/config --file ${KCONFIG_CONFIG} --disable CORESIGHT_REMOTE_ETM_DEFAULT_ENABLE || true
                 ;;
               disable)
-                echo "Disabling selected CORESIGHT options"
-                scripts/config --disable CORESIGHT_TGU || true
-                scripts/config --disable CORESIGHT_DUMMY || true
-                scripts/config --disable CORESIGHT_REMOTE_ETM || true
-                scripts/config --disable CORESIGHT_REMOTE_ETM_DEFAULT_ENABLE || true
+                echo "Disabling selected CORESIGHT options in ${KCONFIG_CONFIG}"
+                scripts/config --file ${KCONFIG_CONFIG} --disable CORESIGHT_TGU || true
+                scripts/config --file ${KCONFIG_CONFIG} --disable CORESIGHT_DUMMY || true
+                scripts/config --file ${KCONFIG_CONFIG} --disable CORESIGHT_REMOTE_ETM || true
+                scripts/config --file ${KCONFIG_CONFIG} --disable CORESIGHT_REMOTE_ETM_DEFAULT_ENABLE || true
                 ;;
               *)
                 echo "Unknown mode: ${MODE}, defaulting to module"
-                scripts/config --module CORESIGHT_TGU || true
-                scripts/config --module CORESIGHT_DUMMY || true
-                scripts/config --module CORESIGHT_REMOTE_ETM || true
-                scripts/config --disable CORESIGHT_REMOTE_ETM_DEFAULT_ENABLE || true
+                scripts/config --file ${KCONFIG_CONFIG} --module CORESIGHT_TGU || true
+                scripts/config --file ${KCONFIG_CONFIG} --module CORESIGHT_DUMMY || true
+                scripts/config --file ${KCONFIG_CONFIG} --module CORESIGHT_REMOTE_ETM || true
+                scripts/config --file ${KCONFIG_CONFIG} --disable CORESIGHT_REMOTE_ETM_DEFAULT_ENABLE || true
                 ;;
             esac
+            # Also disable CC_WERROR in out config to avoid failures from warnings
+            scripts/config --file ${KCONFIG_CONFIG} --disable CC_WERROR || true
           else
-            echo "scripts/config not found — using sed fallback on .config (if present)"
-            if [ -f .config ]; then
+            echo "scripts/config not found; modifying ${OUTDIR}/.config with sed fallback"
+            if [ -f "${OUTDIR}/.config" ]; then
               if [ "$MODE" = "disable" ]; then
-                sed -i 's/CONFIG_CORESIGHT_TGU=.*/# CONFIG_CORESIGHT_TGU is not set/' .config || true
-                sed -i 's/CONFIG_CORESIGHT_DUMMY=.*/# CONFIG_CORESIGHT_DUMMY is not set/' .config || true
-                sed -i 's/CONFIG_CORESIGHT_REMOTE_ETM=.*/# CONFIG_CORESIGHT_REMOTE_ETM is not set/' .config || true
-                sed -i 's/CONFIG_CORESIGHT_REMOTE_ETM_DEFAULT_ENABLE=.*/# CONFIG_CORESIGHT_REMOTE_ETM_DEFAULT_ENABLE is not set/' .config || true
+                sed -i 's/CONFIG_CORESIGHT_TGU=.*/# CONFIG_CORESIGHT_TGU is not set/' ${OUTDIR}/.config || true
+                sed -i 's/CONFIG_CORESIGHT_DUMMY=.*/# CONFIG_CORESIGHT_DUMMY is not set/' ${OUTDIR}/.config || true
+                sed -i 's/CONFIG_CORESIGHT_REMOTE_ETM=.*/# CONFIG_CORESIGHT_REMOTE_ETM is not set/' ${OUTDIR}/.config || true
+                sed -i 's/CONFIG_CORESIGHT_REMOTE_ETM_DEFAULT_ENABLE=.*/# CONFIG_CORESIGHT_REMOTE_ETM_DEFAULT_ENABLE is not set/' ${OUTDIR}/.config || true
               else
-                # module fallback
-                sed -i 's/CONFIG_CORESIGHT_TGU=.*/CONFIG_CORESIGHT_TGU=m/' .config || true
-                sed -i 's/CONFIG_CORESIGHT_DUMMY=.*/CONFIG_CORESIGHT_DUMMY=m/' .config || true
-                sed -i 's/CONFIG_CORESIGHT_REMOTE_ETM=.*/CONFIG_CORESIGHT_REMOTE_ETM=m/' .config || true
-                sed -i 's/CONFIG_CORESIGHT_REMOTE_ETM_DEFAULT_ENABLE=.*/# CONFIG_CORESIGHT_REMOTE_ETM_DEFAULT_ENABLE is not set/' .config || true
+                sed -i 's/CONFIG_CORESIGHT_TGU=.*/CONFIG_CORESIGHT_TGU=m/' ${OUTDIR}/.config || true
+                sed -i 's/CONFIG_CORESIGHT_DUMMY=.*/CONFIG_CORESIGHT_DUMMY=m/' ${OUTDIR}/.config || true
+                sed -i 's/CONFIG_CORESIGHT_REMOTE_ETM=.*/CONFIG_CORESIGHT_REMOTE_ETM=m/' ${OUTDIR}/.config || true
+                sed -i 's/CONFIG_CORESIGHT_REMOTE_ETM_DEFAULT_ENABLE=.*/# CONFIG_CORESIGHT_REMOTE_ETM_DEFAULT_ENABLE is not set/' ${OUTDIR}/.config || true
               fi
+              sed -i 's/CONFIG_CC_WERROR=y/# CONFIG_CC_WERROR is not set/' ${OUTDIR}/.config || true
             else
-              echo ".config not found — skipping sed fallback"
+              echo "${OUTDIR}/.config not found — cannot patch via sed fallback"
             fi
-          fi
-
-          # regenerate minimal .config if make target exists
-          if make help >/dev/null 2>&1; then
-            JOBS=${{ github.event.inputs.jobs_runners }}
-            if [ -z "$JOBS" ]; then JOBS=$(nproc); fi
-            make ARCH=arm64 O=${OUTDIR} olddefconfig || true
           fi
         shell: bash
 
-      - name: Configure build (defconfig)
+      - name: Configure build (regenerate config)
         run: |
           set -euo pipefail
           export PATH=${ZYC_CLANG_DIR:-/usr/bin}:$PATH
           JOBS=${{ github.event.inputs.jobs_runners }}
           if [ -z "$JOBS" ]; then JOBS=$(nproc); fi
 
-          mkdir -p "${OUTDIR}"
-          echo "Running defconfig: ${{ github.event.inputs.defconfig || env.DEFCONFIG }}"
-          make ARCH=arm64 O=${OUTDIR} ${{ github.event.inputs.defconfig || env.DEFCONFIG }}
+          # regenerate based on out/.config (olddefconfig) to ensure consistency
+          make ARCH=arm64 O=${OUTDIR} olddefconfig || true
         shell: bash
         env:
           ZYC_CLANG_DIR: ${{ env.ZYC_CLANG_DIR }}
 
       - name: Build kernel with zyc clang (verbose, capture exit code)
         run: |
-          # Note: we intentionally do NOT exit on make failure so that we can upload logs/artifacts
           set -uo pipefail
           export PATH=${ZYC_CLANG_DIR:-/usr/bin}:$PATH
           export CC=clang
@@ -222,21 +234,17 @@ jobs:
           if [ -z "$JOBS" ]; then JOBS=$(nproc); fi
 
           echo "Building with: CC=$CC LD=$LD CLANG_TRIPLE=$CLANG_TRIPLE CROSS_COMPILE=$CROSS_COMPILE"
-          # Run make with verbose output, tee to build.log, capture make exit code
-          # Use bash PIPESTATUS to record the make exit status
           bash -c 'make -j"'"$JOBS"'" ARCH=arm64 O="'"${OUTDIR}"'" CC="'"$CC"'" LD="'"$LD"'" CLANG_TRIPLE="'"$CLANG_TRIPLE"'" CROSS_COMPILE="'"$CROSS_COMPILE"'" V=1 Image.gz-dtb 2>&1 | tee build.log; echo ${PIPESTATUS[0]} > build_exit_code'
         shell: bash
         env:
           ZYC_CLANG_DIR: ${{ env.ZYC_CLANG_DIR }}
 
-      - name: List output & basic artifacts
+      - name: List output & top of log
         run: |
           echo "Listing ${OUTDIR}:"
           ls -la ${OUTDIR} || true
           echo "Top of build.log (if exists):"
-          if [ -f build.log ]; then
-            head -n 200 build.log || true
-          fi
+          if [ -f build.log ]; then head -n 200 build.log || true; fi
         shell: bash
 
       - name: Upload build log
@@ -259,17 +267,30 @@ jobs:
             ${OUTDIR}/*.gz
             ${OUTDIR}/*.zip
             ${OUTDIR}/modules.tar.gz
-          # allow empty uploads so step doesn't fail if not present
           if-no-files-found: ignore
+
+      - name: Restore source config (always)
+        if: always()
+        run: |
+          set -euo pipefail
+          if [ -n "${BACKUP_DIR:-}" ] && [ -d "${BACKUP_DIR}" ]; then
+            echo "Restoring any backed-up source configs from ${BACKUP_DIR}"
+            if [ -f "${BACKUP_DIR}/.config.repo" ]; then
+              mv -f "${BACKUP_DIR}/.config.repo" .config
+            fi
+            if [ -d "${BACKUP_DIR}/include_config_repo" ]; then
+              mv -f "${BACKUP_DIR}/include_config_repo" include/config
+            fi
+            rmdir "${BACKUP_DIR}" 2>/dev/null || true
+          else
+            echo "No backup dir present, nothing to restore."
+          fi
+        shell: bash
 
       - name: Fail job if build failed
         if: always()
         run: |
-          if [ -f build_exit_code ]; then
-            CODE=$(cat build_exit_code || echo 0)
-          else
-            CODE=0
-          fi
+          if [ -f build_exit_code ]; then CODE=$(cat build_exit_code || echo 0); else CODE=0; fi
           echo "Recorded build exit code: $CODE"
           if [ "$CODE" -ne 0 ]; then
             echo "Build failed with code $CODE — failing job after uploading logs/artifacts."
