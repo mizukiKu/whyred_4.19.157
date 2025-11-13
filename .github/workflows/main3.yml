@@ -1,4 +1,4 @@
-name: Kernel Build 4.19 noh
+name: Kernel Build 4.19
 
 on:
   workflow_dispatch:
@@ -92,21 +92,50 @@ jobs:
 
     - name: Building kernel
       run: |
-        set -e
+        # stop on error and ensure pipeline failures propagate
+        set -eo pipefail
+
         export CLANGDIR="${{ steps.tools.outputs.tools-folder }}/clang"
-        rm -f ${{ steps.kernel.outputs.kernel-folder }}/out/compile.log
-        mkdir -p ${{ steps.kernel.outputs.kernel-folder }}/out
+        export KERNEL_DIR="${{ steps.kernel.outputs.kernel-folder }}"
+        export OUT_DIR="${KERNEL_DIR}/out"
+        mkdir -p "${OUT_DIR}"
+        rm -f "${OUT_DIR}/compile.log"
+
+        # ensure we always copy out/compile.log back to workspace even on failure
+        trap 'cp -f "${OUT_DIR}/compile.log" $GITHUB_WORKSPACE/ || true' EXIT
 
         export KBUILD_BUILD_USER="builder"
         export KBUILD_BUILD_HOST="dhamarar"
         export USE_CCACHE=1
         export PATH="$CLANGDIR/bin:$PATH"
-        
         export KCFLAGS="$KCFLAGS -Wno-default-const-init-field-unsafe"
-        
-        make clean && make mrproper
-        make O=out ARCH=arm64 ${{ github.event.inputs.DEFCONFIG }}_defconfig
 
+        cd "${KERNEL_DIR}"
+
+        # Determine proper defconfig target:
+        # - If user passed 'defconfig', 'something_defconfig', or 'something', handle correctly.
+        INPUT_DEF="${{ github.event.inputs.DEFCONFIG }}"
+        # normalize: remove trailing _defconfig if present
+        NORMALIZED_DEF="$(echo "${INPUT_DEF}" | sed -E 's/_?defconfig$//')"
+
+        # If user intentionally provided literally "defconfig", we can't guess the real name;
+        # in that case use 'defconfig' (i.e., target: defconfig_defconfig) — but that's rarely desired.
+        # Preferred flow: user should pass base name like 'whyred' or 'whyred_defconfig' or 'defconfig_name'.
+        if [ -z "$NORMALIZED_DEF" ]; then
+          # fallback to 'defconfig' (original behavior)
+          DEF_TARGET="defconfig_defconfig"
+        else
+          # target should be "<normalized>_defconfig"
+          DEF_TARGET="${NORMALIZED_DEF}_defconfig"
+        fi
+
+        echo "Using defconfig target: ${DEF_TARGET}"
+        echo "Kernel out dir: ${OUT_DIR}"
+
+        # Generate the defconfig (this will fail if the name is wrong)
+        make O=out ARCH=arm64 "${DEF_TARGET}" 2>&1 | tee -a "${OUT_DIR}/compile.log"
+
+        # Build (ensure build output is tee'd into compile.log)
         make -j$(nproc --all) O=out LLVM=1 LLVM_IAS=1 \
          ARCH=arm64 \
          CC=clang \
@@ -124,10 +153,10 @@ jobs:
          HOSTLD=ld.lld \
          CROSS_COMPILE=aarch64-linux-gnu- \
          CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
-         2>&1 | tee -a ${{ steps.kernel.outputs.kernel-folder }}/out/compile.log
-         
-        cp ${{ steps.kernel.outputs.kernel-folder }}/out/compile.log $GITHUB_WORKSPACE/
-        echo "elapsed_time=$(echo "$(date +%s)"-"${{ steps.workspace.outputs.start_time }}" | bc)" >> $GITHUB_OUTPUT
+         2>&1 | tee -a "${OUT_DIR}/compile.log"
+
+        # elapsed time for build (only reached if build succeeded)
+        echo "elapsed_time=$(echo \"$(date +%s)\"-\"${{ steps.workspace.outputs.start_time }}\" | bc)" >> $GITHUB_OUTPUT
       working-directory: ${{ steps.kernel.outputs.kernel-folder }}
       id: build
 
