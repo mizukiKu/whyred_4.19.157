@@ -1,98 +1,6 @@
-name: Kernel Build 4.19
-
-on:
-  workflow_dispatch:
-    inputs:
-      DEVICE:
-        description: 'Device'
-        default: Whyred
-        required: true
-      KERNEL_SOURCE:
-        description: 'Kernel Source'
-        default: https://github.com/mizukiKu/whyred_4.19.157.git
-        required: true
-      KERNEL_SOURCE_BRANCH:
-        description: 'Kernel Source Branch'
-        required: true
-      DEFCONFIG:
-        description: 'defconfig'
-        required: true
-      ANYKERNEL_URL:
-        description: 'AnyKernel Url'
-        default: https://github.com/dhamar19/AnyKernel3.git
-        required: false
-      ANYKERNEL_BRANCH:
-        description: 'AnyKernel Branch'
-        default: whyred
-        required: true
-      ENABLE_KERNELSU:
-        description: 'KernelSU'
-        type: boolean
-        default: false
-      KERNELSU_URL:
-        description: 'Full KernelSU URL'
-        required: false
-        default: curl -LSs "https://raw.githubusercontent.com/rsuntk/KernelSU/main/kernel/setup.sh" | bash -s main
-
-jobs:
-  build:
-    if: github.event.repository.owner.id == github.event.sender.id
-    runs-on: ubuntu-22.04
-    permissions:
-      contents: write
-    steps:
-
-    - name: Display User Inputs
+- name: Building kernel
       run: |
-        echo "::group::User Environment Variables"
-        echo "DEVICE: ${{ github.event.inputs.DEVICE }}"
-        echo "Kernel Source: ${{ github.event.inputs.KERNEL_SOURCE }}/tree/${{ github.event.inputs.KERNEL_SOURCE_BRANCH }}"
-        echo "Kernel Defconfig: ${{ github.event.inputs.DEFCONFIG }}"
-        echo "AnyKernel Url: ${{ github.event.inputs.ANYKERNEL_URL }}/tree/${{ github.event.inputs.ANYKERNEL_BRANCH }}"
-        echo "KernelSU: ${{ fromJSON('["No", "Yes"]')[fromJSON(github.event.inputs.ENABLE_KERNELSU)] }}"
-        echo "Full KernelSU URL: ${{ github.event.inputs.KERNELSU_URL}}"
-        echo "::endgroup::"
-
-    - name: Initialize workspace
-      run: |
-        mkdir workspace
-        cd workspace
-        echo "workspace-folder=$(pwd)" >> $GITHUB_OUTPUT
-        echo "start_time=$(date +%s)" >> $GITHUB_OUTPUT
-        echo "kernelsu=${{ fromJSON('["No", "Yes"]')[fromJSON(github.event.inputs.ENABLE_KERNELSU)] }}" >> $GITHUB_OUTPUT
-      id: workspace
-      
-    - name: Prepare the build environment
-      run: |
-        sudo apt update -y && sudo apt upgrade -y
-        sudo apt-get install -y bc flex curl git zip ftp libncurses5 libssl-dev lftp zstd wget libfl-dev python3 libarchive-tools gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
-        mkdir clang && curl https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/508ea7dd0d8f681904d0422e98af9613aaabf180/clang-r574158.tar.gz -RLO && tar -C clang/ -xf clang-*.tar.gz
-        echo "tools-folder=$(pwd)" >> $GITHUB_OUTPUT
-      working-directory: ${{ steps.workspace.outputs.workspace-folder }}
-      id: tools
-
-    - name: Clone kernel source
-      run: |
-        git clone --depth=1 ${{ github.event.inputs.KERNEL_SOURCE }} -b ${{ github.event.inputs.KERNEL_SOURCE_BRANCH }} kernel_tree
-        echo "kernel-folder=$(pwd)/kernel_tree" >> $GITHUB_OUTPUT
-      working-directory: ${{ steps.workspace.outputs.workspace-folder }}
-      id: kernel
-
-    - name: Adding KernelSU
-      if: ${{ steps.workspace.outputs.kernelsu == 'Yes' }}
-      run: |
-        if [ -d "KernelSU" ]; then
-          rm -rf "KernelSU"
-        fi
-        if [ -d "drivers/kernelsu" ]; then
-          rm -rf "drivers/kernelsu"
-        fi
-        eval ${{ github.event.inputs.KERNELSU_URL }}
-      working-directory: ${{ steps.kernel.outputs.kernel-folder }}
-
-    - name: Building kernel
-      run: |
-        # stop on error and ensure pipeline failures propagate
+        # stop on error and ensure pipeline failures propagate, but ensure cleanup runs
         set -eo pipefail
 
         export CLANGDIR="${{ steps.tools.outputs.tools-folder }}/clang"
@@ -101,120 +9,96 @@ jobs:
         mkdir -p "${OUT_DIR}"
         rm -f "${OUT_DIR}/compile.log"
 
-        # ensure we always copy out/compile.log back to workspace even on failure
+        # selalu salin compile.log ke workspace meskipun build gagal
         trap 'cp -f "${OUT_DIR}/compile.log" $GITHUB_WORKSPACE/ || true' EXIT
 
+        # environment
         export KBUILD_BUILD_USER="builder"
         export KBUILD_BUILD_HOST="dhamarar"
         export USE_CCACHE=1
         export PATH="$CLANGDIR/bin:$PATH"
         export KCFLAGS="$KCFLAGS -Wno-default-const-init-field-unsafe"
 
+        # safer defaults for GitHub Actions (runners punya RAM terbatas)
+        # JOBS input dapat ditambahkan di bagian `on.workflow_dispatch.inputs`:
+        # JOBS: description: 'make -j jobs' default: '2' required: false
+        JOBS="${{ github.event.inputs.JOBS || '2' }}"
+        # limit jobs to a reasonable integer (fallback to 2 jika input aneh)
+        if ! [[ "$JOBS" =~ ^[0-9]+$ ]]; then
+          JOBS=2
+        fi
+
+        # relax stack size (kadang membantu)
+        ulimit -s unlimited || true
+
+        # configure ccache size (jika tersedia)
+        if command -v ccache >/dev/null 2>&1; then
+          ccache -M 50G || true
+        fi
+
         cd "${KERNEL_DIR}"
 
         # Determine proper defconfig target:
-        # - If user passed 'defconfig', 'something_defconfig', or 'something', handle correctly.
         INPUT_DEF="${{ github.event.inputs.DEFCONFIG }}"
-        # normalize: remove trailing _defconfig if present
         NORMALIZED_DEF="$(echo "${INPUT_DEF}" | sed -E 's/_?defconfig$//')"
-
-        # If user intentionally provided literally "defconfig", we can't guess the real name;
-        # in that case use 'defconfig' (i.e., target: defconfig_defconfig) — but that's rarely desired.
-        # Preferred flow: user should pass base name like 'whyred' or 'whyred_defconfig' or 'defconfig_name'.
         if [ -z "$NORMALIZED_DEF" ]; then
-          # fallback to 'defconfig' (original behavior)
           DEF_TARGET="defconfig_defconfig"
         else
-          # target should be "<normalized>_defconfig"
           DEF_TARGET="${NORMALIZED_DEF}_defconfig"
         fi
 
         echo "Using defconfig target: ${DEF_TARGET}"
+        echo "Make jobs: ${JOBS}"
         echo "Kernel out dir: ${OUT_DIR}"
 
-        # Generate the defconfig (this will fail if the name is wrong)
-        make O=out ARCH=arm64 "${DEF_TARGET}" 2>&1 | tee -a "${OUT_DIR}/compile.log"
+        # run defconfig target (tee to compile.log)
+        if ! make O=out ARCH=arm64 "${DEF_TARGET}" 2>&1 | tee -a "${OUT_DIR}/compile.log"; then
+          echo "ERROR: generating defconfig failed — lihat compile.log (uploaded as artifact)." >&2
+          exit 2
+        fi
 
-        # Build (ensure build output is tee'd into compile.log)
-        make -j$(nproc --all) O=out LLVM=1 LLVM_IAS=1 \
-         ARCH=arm64 \
-         CC=clang \
-         LD=ld.lld \
-         AR=llvm-ar \
-         AS=llvm-as \
-         NM=llvm-nm \
-         STRIP=llvm-strip \
-         OBJCOPY=llvm-objcopy \
-         OBJDUMP=llvm-objdump \
-         READELF=llvm-readelf \
-         HOSTCC=clang \
-         HOSTCXX=clang++ \
-         HOSTAR=llvm-ar \
-         HOSTLD=ld.lld \
-         CROSS_COMPILE=aarch64-linux-gnu- \
-         CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
-         2>&1 | tee -a "${OUT_DIR}/compile.log"
+        # run build with controlled parallelism; capture exit code but keep trap to copy log
+        if ! make -j"${JOBS}" O=out LLVM=1 LLVM_IAS=1 \
+           ARCH=arm64 \
+           CC=clang \
+           LD=ld.lld \
+           AR=llvm-ar \
+           AS=llvm-as \
+           NM=llvm-nm \
+           STRIP=llvm-strip \
+           OBJCOPY=llvm-objcopy \
+           OBJDUMP=llvm-objdump \
+           READELF=llvm-readelf \
+           HOSTCC=clang \
+           HOSTCXX=clang++ \
+           HOSTAR=llvm-ar \
+           HOSTLD=ld.lld \
+           CROSS_COMPILE=aarch64-linux-gnu- \
+           CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
+           2>&1 | tee -a "${OUT_DIR}/compile.log"; then
+
+          BUILD_EXIT=$?
+          echo "BUILD FAILED with exit code ${BUILD_EXIT}" >&2
+
+          # show last lines for quick diagnosis
+          echo "===== TAIL compile.log (last 200 lines) ====="
+          tail -n 200 "${OUT_DIR}/compile.log" || true
+          echo "============================================="
+
+          # simple heuristics: cari indikasi OOM / KILLED
+          if grep -i -E "killed|out of memory|oom" "${OUT_DIR}/compile.log" >/dev/null 2>&1; then
+            echo ""
+            echo "=== Detected possible out-of-memory (OOM) or killed process ==="
+            echo "Saran: kurangi jumlah JOBS (input 'JOBS') menjadi 1 atau 2, atau gunakan runner dengan lebih banyak memori."
+            echo "Contoh: set DEFCONFIG dan JOBS saat menjalankan workflow: JOBS=1"
+            echo ""
+          fi
+
+          # exit with original code so GitHub shows failure
+          exit "${BUILD_EXIT}"
+        fi
 
         # elapsed time for build (only reached if build succeeded)
         echo "elapsed_time=$(echo \"$(date +%s)\"-\"${{ steps.workspace.outputs.start_time }}\" | bc)" >> $GITHUB_OUTPUT
       working-directory: ${{ steps.kernel.outputs.kernel-folder }}
       id: build
-
-    - name: AnyKernel3
-      if: ${{ success() && github.event.inputs.ANYKERNEL_URL != '' }}
-      run: |
-        set -e
-        if [[ -z "${{ github.event.inputs.ANYKERNEL_BRANCH }}" ]]; then
-          anykernel_branch=${{ github.event.inputs.DEFCONFIG }}
-        else
-          anykernel_branch=${{ github.event.inputs.ANYKERNEL_BRANCH }}
-        fi
-        git clone --recursive --depth=1 ${{ github.event.inputs.ANYKERNEL_URL }} -b $anykernel_branch AnyKernel3
-
-        if [ -f "Image.gz-dtb" ]; then
-          cp -f Image.gz-dtb AnyKernel3/Image.gz-dtb
-        elif [ -f "Image.gz" ]; then
-          cp -f Image.gz AnyKernel3/Image.gz
-        elif [ -f "Image" ]; then
-          cp -f Image AnyKernel3/Image
-        else
-          echo "Error: Tidak menemukan Image atau Image.gz!"
-          exit 1
-        fi
-
-        name=AnyKernel3-Fulmen-${{ github.event.inputs.DEVICE }}${{ fromJSON('["", "-KSU"]')[fromJSON(github.event.inputs.ENABLE_KERNELSU)] }}-$(date +%Y%m%d-%H%M).zip
-        cd AnyKernel3
-        zip -q -r $name *
-        mv $name ../
-        echo "zipname=$name" >> $GITHUB_OUTPUT
-      working-directory: ${{ steps.kernel.outputs.kernel-folder }}/out/arch/arm64/boot/
-      id: anykernel
-      
-    - name: Get build info
-      run: |
-        cd ${{ steps.kernel.outputs.kernel-folder }}
-        CLANG_PATH="${{ steps.tools.outputs.tools-folder }}/clang/bin/clang"
-        echo "KERNEL_VERSION=$(make kernelversion)" >> $GITHUB_ENV
-        echo "CLANG_VERSION=$($CLANG_PATH --version | head -n1)" >> $GITHUB_ENV
-        echo "LAST_COMMIT=$(git log -1 --pretty=format:'%h - %s')" >> $GITHUB_ENV
-        ls -al ${{ steps.kernel.outputs.kernel-folder }}/out/arch/arm64/boot/
-        
-    - name: Upload Kernel
-      if: ${{ success() && steps.anykernel.outputs.zipname != '' }} 
-      uses: actions/upload-artifact@v4
-      with:
-        name: ${{ steps.anykernel.outputs.zipname }}
-        path: |
-          ${{ steps.kernel.outputs.kernel-folder }}/out/arch/arm64/boot/${{ steps.anykernel.outputs.zipname }}
-          ${{ steps.kernel.outputs.kernel-folder }}/out/${{ steps.anykernel.outputs.zipname }}
-          ${{ steps.kernel.outputs.kernel-folder }}/**/${{ steps.anykernel.outputs.zipname }}
-
-    - name: Upload Build Log
-      if: always()
-      uses: actions/upload-artifact@v4
-      with:
-        name: compile.log
-        path: |
-          ${{ steps.kernel.outputs.kernel-folder }}/out/compile.log
-          $GITHUB_WORKSPACE/compile.log
-        compression-level: 0
