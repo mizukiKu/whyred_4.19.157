@@ -5,17 +5,17 @@ on:
     inputs:
       DEVICE:
         description: 'Device'
-        default: Blossom
+        default: Whyred
         required: true
       KERNEL_SOURCE:
         description: 'Kernel Source'
-        default: https://github.com/dhamar19/niigo_kernel_xiaomi_blossom.git
+        default: https://github.com/mizukiKu/whyred_4.19.157.git
         required: true
       KERNEL_SOURCE_BRANCH:
         description: 'Kernel Source Branch'
         required: true
       DEFCONFIG:
-        description: 'Kernel Defconfig'
+        description: 'defconfig'
         required: true
       ANYKERNEL_URL:
         description: 'AnyKernel Url'
@@ -23,7 +23,7 @@ on:
         required: false
       ANYKERNEL_BRANCH:
         description: 'AnyKernel Branch'
-        default: blossom
+        default: whyred
         required: true
       ENABLE_KERNELSU:
         description: 'KernelSU'
