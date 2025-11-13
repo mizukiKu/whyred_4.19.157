@@ -1,22 +1,155 @@
-name: Kernel Build
+name: Kernel Build (zyc clang)
 
 on:
   workflow_dispatch:
+    inputs:
+      zyc_clang_url:
+        description: 'URL to zyc clang archive (tar.xz or zip). Leave empty to use ZYC_CLANG_URL secret/env.'
+        required: false
+      defconfig:
+        description: 'Kernel defconfig (default: defconfig)'
+        required: false
+        default: defconfig
+      jobs_runners:
+        description: 'Number of parallel jobs (optional)'
+        required: false
+        default: ''
+
+env:
+  # Default name/tags
+  NAME: RezzzzFy
+  OUTDIR: out
+  # You can set this secret in repo settings or pass as workflow_dispatch input
+  ZYC_CLANG_URL: ${{ github.event.inputs.zyc_clang_url || secrets.ZYC_CLANG_URL || '' }}
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
-    - name: Checkout kernel source
-      uses: actions/checkout@v4
+      - name: Checkout kernel source
+        uses: actions/checkout@v4
 
-    - name: Android kernel build
-      uses: lemniskett/android-kernel-actions@master
-      id: build
-      env:
-        NAME: RezzzzFy
-      with:
-        arch: arm64
-        compiler: gcc/12
-        defconfig: defconfig
-        image: Image.gz-dtb
+      - name: Show chosen inputs
+        run: |
+          echo "DEFCONFIG=${{ github.event.inputs.defconfig }}"
+          echo "ZYC_CLANG_URL=${{ env.ZYC_CLANG_URL }}"
+          echo "JOBS=${{ github.event.inputs.jobs_runners }}"
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            build-essential bc bison flex libssl-dev libncurses-dev ccache \
+            python3 python3-distutils wget unzip xz-utils curl \
+            lld clang llvm binutils-aarch64-linux-gnu gcc-aarch64-linux-gnu \
+            crossbuild-essential-arm64
+          # optional: enable ccache dir
+          mkdir -p $HOME/.ccache
+        shell: bash
+
+      - name: Download & extract zyc clang
+        if: env.ZYC_CLANG_URL != ''
+        run: |
+          TOOLSDIR=$(pwd)/toolchains
+          mkdir -p "${TOOLSDIR}"
+          ARCHIVE="${TOOLSDIR}/zycclang_archive"
+          echo "Downloading ZYC clang from: ${ZYC_CLANG_URL}"
+          curl -L --retry 5 -o "${ARCHIVE}" "${ZYC_CLANG_URL}"
+          # try extraction depending on file type
+          file "${ARCHIVE}" || true
+          if file "${ARCHIVE}" | grep -q "XZ compressed"; then
+            tar -xJf "${ARCHIVE}" -C "${TOOLSDIR}"
+          elif file "${ARCHIVE}" | grep -q "gzip compressed"; then
+            tar -xzf "${ARCHIVE}" -C "${TOOLSDIR}"
+          elif file "${ARCHIVE}" | grep -q "Zip archive data"; then
+            unzip -q "${ARCHIVE}" -d "${TOOLSDIR}"
+          else
+            echo "Unknown archive format; attempting tar -xf"
+            tar -xf "${ARCHIVE}" -C "${TOOLSDIR}" || true
+          fi
+          echo "Toolchains extracted to ${TOOLSDIR}:"
+          ls -la "${TOOLSDIR}"
+        shell: bash
+
+      - name: Setup PATH to zyc clang
+        if: env.ZYC_CLANG_URL != ''
+        run: |
+          # Try to auto-detect clang dir under toolchains
+          TOOLSDIR=$(pwd)/toolchains
+          # find a directory that contains bin/clang
+          CLANG_DIR=$(find "${TOOLSDIR}" -type f -name clang -printf '%h\n' | head -n1 || true)
+          if [ -z "${CLANG_DIR}" ]; then
+            echo "ERROR: clang binary not found under ${TOOLSDIR}"
+            ls -R "${TOOLSDIR}"
+            exit 1
+          fi
+          echo "Found clang in: ${CLANG_DIR}"
+          echo "##[set-output name=clang_dir;]${CLANG_DIR}"
+          echo "export ZYC_CLANG_DIR=${CLANG_DIR}" >> $GITHUB_ENV
+          echo "export PATH=${CLANG_DIR}:$PATH" >> $GITHUB_ENV
+        shell: bash
+
+      - name: Print toolchain info
+        run: |
+          echo "clang version:"
+          clang --version || true
+          echo "lld version:"
+          ld.lld --version || true
+          echo "aarch64 gcc:"
+          aarch64-linux-gnu-gcc --version || true
+        shell: bash
+
+      - name: Configure build (defconfig)
+        run: |
+          export PATH=${ZYC_CLANG_DIR:-/usr/bin}:$PATH
+          # allow override of jobs
+          JOBS=${{ github.event.inputs.jobs_runners }}
+          if [ -z "$JOBS" ]; then
+            JOBS=$(nproc)
+          fi
+          mkdir -p "${OUTDIR}"
+          # apply defconfig (adjust ARCH if needed)
+          make ARCH=arm64 O=${OUTDIR} ${{ github.event.inputs.defconfig || env.DEFCONFIG }}
+        shell: bash
+        env:
+          ZYC_CLANG_DIR: ${{ env.ZYC_CLANG_DIR }}
+
+      - name: Build kernel with zyc clang
+        run: |
+          set -euo pipefail
+          export PATH=${ZYC_CLANG_DIR:-/usr/bin}:$PATH
+          export CC=clang
+          export LD=ld.lld
+          export CLANG_TRIPLE=aarch64-linux-gnu-
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          # optional extra CFLAGS for older kernels
+          export KCFLAGS="-march=armv8-a"
+          JOBS=${{ github.event.inputs.jobs_runners }}
+          if [ -z "$JOBS" ]; then
+            JOBS=$(nproc)
+          fi
+
+          echo "Building with: CC=$CC LD=$LD CLANG_TRIPLE=$CLANG_TRIPLE CROSS_COMPILE=$CROSS_COMPILE"
+          make -j"$JOBS" ARCH=arm64 O=${OUTDIR} CC=${CC} LD=${LD} \
+            CLANG_TRIPLE=${CLANG_TRIPLE} CROSS_COMPILE=${CROSS_COMPILE} Image.gz-dtb || (tail -n 200 ${OUTDIR}/.config || true; exit 1)
+        shell: bash
+        env:
+          ZYC_CLANG_DIR: ${{ env.ZYC_CLANG_DIR }}
+
+      - name: List output
+        run: |
+          ls -la ${OUTDIR} || true
+
+      - name: Upload kernel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-${{ env.NAME }}-build
+          path: |
+            ${OUTDIR}/Image*
+            ${OUTDIR}/*.img
+            ${OUTDIR}/*.dtb
+            ${OUTDIR}/*.gz
+            ${OUTDIR}/*.zip
+            ${OUTDIR}/modules.tar.gz
