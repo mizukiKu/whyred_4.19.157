@@ -1,304 +1,33 @@
-name: Kernel Build (LLVM 21.1.5, coresight-safe, verbose log)
+name: Kernel Build
 
 on:
   workflow_dispatch:
-    inputs:
-      llvm_url:
-        description: 'URL to LLVM release archive (tar.xz/zip). Default points to llvmorg-21.1.5 release.'
-        required: false
-        default: 'https://github.com/llvm/llvm-project/releases/download/llvmorg-21.1.5/clang+llvm-21.0.2-x86_64-linux-gnu-ubuntu-18.04.tar.xz'
-      defconfig:
-        description: 'Kernel defconfig (default: whyred_defconfig)'
-        required: false
-        default: whyred_defconfig
-      jobs_runners:
-        description: 'Number of parallel jobs (optional)'
-        required: false
-        default: ''
-      coresight_mode:
-        description: "How to treat CORESIGHT options: keep | module | disable (default: module)"
-        required: false
-        default: module
-
-env:
-  NAME: RezzzzFy
-  OUTDIR: out
-  # fallback to secret if not provided via dispatch
-  LLVM_URL: ${{ github.event.inputs.llvm_url || secrets.LLVM_URL || '' }}
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-
     steps:
-      - name: Checkout kernel source
-        uses: actions/checkout@v4
+    - name: Checkout kernel source
+      uses: actions/checkout@v4
 
-      - name: Show chosen inputs
-        run: |
-          echo "DEFCONFIG=${{ github.event.inputs.defconfig }}"
-          echo "LLVM_URL=${{ env.LLVM_URL }}"
-          echo "JOBS=${{ github.event.inputs.jobs_runners }}"
-          echo "CORESIGHT_MODE=${{ github.event.inputs.coresight_mode }}"
+    - name: Set up MemKernel as a module (M-OUT) with specified name
+      run: |
+        curl -LSs "https://raw.githubusercontent.com/anko5/MemKernel/refs/heads/main/kernel/setup.sh" | bash -s M dogi
+    - name: Android kernel build
+      uses: lemniskett/android-kernel-actions@master
+      id: build
+      env:
+        NAME: RezzzzFy
+      with:
+        arch: arm64
+        compiler: clang/11
+        defconfig: vendor/whyred_defconfig
+        image: Image.gz-dtb
 
-      - name: Install build dependencies (robust for LLVM)
-        run: |
-          set -euo pipefail
-          sudo apt-get update
-
-          # base essentials + kernel build deps
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-            build-essential bc bison flex libssl-dev libncurses-dev ccache \
-            python3 python3-dev wget unzip xz-utils curl git \
-            binutils-aarch64-linux-gnu gcc-aarch64-linux-gnu crossbuild-essential-arm64 \
-            libelf-dev libiberty-dev pkg-config
-
-          # Install lld/llvm from apt as fallback (but we'll prefer downloaded LLVM)
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-            clang lld llvm || true
-
-          # python3-distutils handling
-          if ! dpkg -s python3-distutils >/dev/null 2>&1; then
-            echo "python3-distutils not present, trying alternatives..."
-            if sudo apt-get install -y python3-distutils 2>/dev/null; then
-              echo "Installed python3-distutils"
-            elif sudo apt-get install -y python3.11-distutils 2>/dev/null; then
-              echo "Installed python3.11-distutils"
-            else
-              echo "Falling back to pip-based setuptools installation"
-              sudo apt-get install -y python3-pip || true
-              python3 -m pip install --user --upgrade pip setuptools wheel || true
-            fi
-          fi
-
-          mkdir -p $HOME/.ccache
-        shell: bash
-
-      - name: Download & extract LLVM toolchain (release)
-        if: env.LLVM_URL != ''
-        run: |
-          set -euo pipefail
-          TOOLDIR=$(pwd)/toolchains/llvm
-          mkdir -p "${TOOLDIR}"
-          ARCHIVE="${TOOLDIR}/llvm_archive"
-          echo "Downloading LLVM from: ${LLVM_URL}"
-          curl -L --retry 5 -o "${ARCHIVE}" "${LLVM_URL}"
-          file "${ARCHIVE}" || true
-
-          # Try extraction depending on archive type
-          if file "${ARCHIVE}" | grep -qi "XZ compressed"; then
-            tar -xJf "${ARCHIVE}" -C "${TOOLDIR}"
-          elif file "${ARCHIVE}" | grep -qi "gzip compressed"; then
-            tar -xzf "${ARCHIVE}" -C "${TOOLDIR}"
-          elif file "${ARCHIVE}" | grep -qi "Zip archive data"; then
-            unzip -q "${ARCHIVE}" -d "${TOOLDIR}"
-          else
-            echo "Unknown archive format; attempting tar -xf"
-            tar -xf "${ARCHIVE}" -C "${TOOLDIR}" || true
-          fi
-
-          # After extraction, find the directory that contains clang
-          CLANG_DIR=$(find "${TOOLDIR}" -maxdepth 2 -type f -name clang -printf '%h\n' | head -n1 || true)
-          if [ -z "${CLANG_DIR}" ]; then
-            echo "WARN: clang not found under ${TOOLDIR}. Listing contents:"
-            ls -la "${TOOLDIR}" || true
-            exit 1
-          fi
-
-          echo "Detected LLVM clang in: ${CLANG_DIR}"
-          echo "LLVM_CLANG_DIR=${CLANG_DIR}" >> $GITHUB_ENV
-          echo "PATH=${CLANG_DIR}:$PATH" >> $GITHUB_ENV
-
-          # show versions
-          "${CLANG_DIR}/clang" --version || true
-          if [ -x "${CLANG_DIR}/lld" ]; then "${CLANG_DIR}/lld" --version || true; fi
-        shell: bash
-
-      - name: Print toolchain info (best-effort)
-        run: |
-          clang --version || true
-          ld.lld --version || true
-          aarch64-linux-gnu-gcc --version || true
-        shell: bash
-
-      - name: Backup source config if present (fix for O=out requirement)
-        id: backup_cfg
-        run: |
-          set -euo pipefail
-          BACKUP_DIR=$(pwd)/.source_config_backup
-          mkdir -p "${BACKUP_DIR}"
-
-          if [ -f .config ]; then
-            echo "Backing up repo .config -> ${BACKUP_DIR}/.config.repo"
-            mv .config "${BACKUP_DIR}/.config.repo"
-          fi
-
-          if [ -d include/config ]; then
-            echo "Backing up repo include/config -> ${BACKUP_DIR}/include_config_repo"
-            mv include/config "${BACKUP_DIR}/include_config_repo"
-          fi
-
-          echo "Backup dir contents:"
-          ls -la "${BACKUP_DIR}" || true
-          echo "BACKUP_DIR=${BACKUP_DIR}" >> $GITHUB_ENV
-        shell: bash
-
-      - name: Apply CORESIGHT config adjustments (keep/module/disable) to OUT/.config
-        run: |
-          set -euo pipefail
-          MODE="${{ github.event.inputs.coresight_mode }}"
-          echo "Applying CORESIGHT mode: ${MODE}"
-
-          JOBS=${{ github.event.inputs.jobs_runners }}
-          if [ -z "$JOBS" ]; then JOBS=$(nproc); fi
-
-          mkdir -p ${OUTDIR}
-
-          # generate defconfig into O/.config
-          make ARCH=arm64 O=${OUTDIR} ${{ github.event.inputs.defconfig || env.DEFCONFIG }}
-
-          if [ -x scripts/config ]; then
-            chmod +x scripts/config
-            export KCONFIG_CONFIG="${PWD}/${OUTDIR}/.config"
-            case "$MODE" in
-              keep)
-                echo "Keeping CORESIGHT settings"
-                ;;
-              module)
-                scripts/config --file ${KCONFIG_CONFIG} --module CORESIGHT_TGU || true
-                scripts/config --file ${KCONFIG_CONFIG} --module CORESIGHT_DUMMY || true
-                scripts/config --file ${KCONFIG_CONFIG} --module CORESIGHT_REMOTE_ETM || true
-                scripts/config --file ${KCONFIG_CONFIG} --disable CORESIGHT_REMOTE_ETM_DEFAULT_ENABLE || true
-                ;;
-              disable)
-                scripts/config --file ${KCONFIG_CONFIG} --disable CORESIGHT_TGU || true
-                scripts.config --file ${KCONFIG_CONFIG} --disable CORESIGHT_DUMMY || true || true
-                scripts/config --file ${KCONFIG_CONFIG} --disable CORESIGHT_REMOTE_ETM || true
-                scripts/config --file ${KCONFIG_CONFIG} --disable CORESIGHT_REMOTE_ETM_DEFAULT_ENABLE || true
-                ;;
-              *)
-                scripts/config --file ${KCONFIG_CONFIG} --module CORESIGHT_TGU || true
-                scripts/config --file ${KCONFIG_CONFIG} --module CORESIGHT_DUMMY || true
-                scripts/config --file ${KCONFIG_CONFIG} --module CORESIGHT_REMOTE_ETM || true
-                scripts/config --file ${KCONFIG_CONFIG} --disable CORESIGHT_REMOTE_ETM_DEFAULT_ENABLE || true
-                ;;
-            esac
-            scripts/config --file ${KCONFIG_CONFIG} --disable CC_WERROR || true
-          else
-            echo "scripts/config not found; sed fallback on ${OUTDIR}/.config"
-            if [ -f "${OUTDIR}/.config" ]; then
-              if [ "$MODE" = "disable" ]; then
-                sed -i 's/CONFIG_CORESIGHT_TGU=.*/# CONFIG_CORESIGHT_TGU is not set/' ${OUTDIR}/.config || true
-                sed -i 's/CONFIG_CORESIGHT_DUMMY=.*/# CONFIG_CORESIGHT_DUMMY is not set/' ${OUTDIR}/.config || true
-                sed -i 's/CONFIG_CORESIGHT_REMOTE_ETM=.*/# CONFIG_CORESIGHT_REMOTE_ETM is not set/' ${OUTDIR}/.config || true
-                sed -i 's/CONFIG_CORESIGHT_REMOTE_ETM_DEFAULT_ENABLE=.*/# CONFIG_CORESIGHT_REMOTE_ETM_DEFAULT_ENABLE is not set/' ${OUTDIR}/.config || true
-              else
-                sed -i 's/CONFIG_CORESIGHT_TGU=.*/CONFIG_CORESIGHT_TGU=m/' ${OUTDIR}/.config || true
-                sed -i 's/CONFIG_CORESIGHT_DUMMY=.*/CONFIG_CORESIGHT_DUMMY=m/' ${OUTDIR}/.config || true
-                sed -i 's/CONFIG_CORESIGHT_REMOTE_ETM=.*/CONFIG_CORESIGHT_REMOTE_ETM=m/' ${OUTDIR}/.config || true
-                sed -i 's/CONFIG_CORESIGHT_REMOTE_ETM_DEFAULT_ENABLE=.*/# CONFIG_CORESIGHT_REMOTE_ETM_DEFAULT_ENABLE is not set/' ${OUTDIR}/.config || true
-              fi
-              sed -i 's/CONFIG_CC_WERROR=y/# CONFIG_CC_WERROR is not set/' ${OUTDIR}/.config || true
-            fi
-          fi
-        shell: bash
-
-      - name: Configure build (regenerate config)
-        run: |
-          set -euo pipefail
-          export PATH=${LLVM_CLANG_DIR:-/usr/bin}:$PATH
-          JOBS=${{ github.event.inputs.jobs_runners }}
-          if [ -z "$JOBS" ]; then JOBS=$(nproc); fi
-
-          make ARCH=arm64 O=${OUTDIR} olddefconfig || true
-        shell: bash
-        env:
-          LLVM_CLANG_DIR: ${{ env.LLVM_CLANG_DIR }}
-
-      - name: Build kernel with LLVM (verbose, capture exit code)
-        run: |
-          set -uo pipefail
-          export PATH=${LLVM_CLANG_DIR:-/usr/bin}:$PATH
-          export CC=clang
-          export HOSTCC=clang
-          export LD=ld.lld
-          export CLANG_TRIPLE=aarch64-linux-gnu-
-          export CROSS_COMPILE=aarch64-linux-gnu-
-          export KCFLAGS="-march=armv8-a"
-
-          # fallback: if lld missing in toolchain dir, use system lld
-          if ! command -v ld.lld >/dev/null 2>&1; then
-            echo "lld not found in PATH; using ld.lld from system if available."
-          fi
-
-          JOBS=${{ github.event.inputs.jobs_runners }}
-          if [ -z "$JOBS" ]; then JOBS=$(nproc); fi
-
-          echo "Building with: CC=$CC LD=$LD CLANG_TRIPLE=$CLANG_TRIPLE CROSS_COMPILE=$CROSS_COMPILE"
-          bash -c 'make -j"'"$JOBS"'" ARCH=arm64 O="'"${OUTDIR}"'" CC="'"$CC"'" LD="'"$LD"'" HOSTCC="'"$HOSTCC"'" CLANG_TRIPLE="'"$CLANG_TRIPLE"'" CROSS_COMPILE="'"$CROSS_COMPILE"'" V=1 Image.gz-dtb 2>&1 | tee build.log; echo ${PIPESTATUS[0]} > build_exit_code'
-        shell: bash
-        env:
-          LLVM_CLANG_DIR: ${{ env.LLVM_CLANG_DIR }}
-
-      - name: List output & top of log
-        run: |
-          echo "Listing ${OUTDIR}:"
-          ls -la ${OUTDIR} || true
-          echo "Top of build.log (if exists):"
-          if [ -f build.log ]; then head -n 200 build.log || true; fi
-        shell: bash
-
-      - name: Upload build log
-        uses: actions/upload-artifact@v4
-        with:
-          name: kernel-build-log
-          path: |
-            build.log
-            build_exit_code
-
-      - name: Upload kernel artifacts (if produced)
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: kernel-artifacts
-          path: |
-            ${OUTDIR}/Image*
-            ${OUTDIR}/*.img
-            ${OUTDIR}/*.dtb
-            ${OUTDIR}/*.gz
-            ${OUTDIR}/*.zip
-            ${OUTDIR}/modules.tar.gz
-          if-no-files-found: ignore
-
-      - name: Restore source config (always)
-        if: always()
-        run: |
-          set -euo pipefail
-          if [ -n "${BACKUP_DIR:-}" ] && [ -d "${BACKUP_DIR}" ]; then
-            echo "Restoring backed-up source configs from ${BACKUP_DIR}"
-            if [ -f "${BACKUP_DIR}/.config.repo" ]; then
-              mv -f "${BACKUP_DIR}/.config.repo" .config
-            fi
-            if [ -d "${BACKUP_DIR}/include_config_repo" ]; then
-              mv -f "${BACKUP_DIR}/include_config_repo" include/config
-            fi
-            rmdir "${BACKUP_DIR}" 2>/dev/null || true
-          else
-            echo "No backup dir present, nothing to restore."
-          fi
-        shell: bash
-
-      - name: Fail job if build failed
-        if: always()
-        run: |
-          if [ -f build_exit_code ]; then CODE=$(cat build_exit_code || echo 0); else CODE=0; fi
-          echo "Recorded build exit code: $CODE"
-          if [ "$CODE" -ne 0 ]; then
-            echo "Build failed with code $CODE — failing job after uploading logs/artifacts."
-            exit $CODE
-          else
-            echo "Build succeeded."
-          fi
-        shell: bash
+    - name: Upload Kernel and Module
+      uses: actions/upload-artifact@v4
+      with:
+        name: moduleandkernel
+        path: |
+          ${{ steps.build.outputs.outfile }}
+          ./out/drivers/memkernel/memkernel.ko
