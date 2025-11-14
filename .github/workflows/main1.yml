@@ -57,13 +57,16 @@ jobs:
         echo "start_time=$(date +%s)" >> $GITHUB_OUTPUT
       id: workspace
 
-    - name: Install dependencies
+    - name: Install dependencies (ensure ld.lld present)
       run: |
         sudo apt update -y
-        sudo apt-get install -y bc flex curl git zip libncurses5 libssl-dev zstd wget libfl-dev python3 libarchive-tools gcc-aarch64-linux-gnu g++-aarch64-linux-gnu ccache
-        mkdir clang
+        # essential build deps + ensure lld (LLVM linker) and clang available
+        sudo apt-get install -y bc flex curl git zip libncurses5 libssl-dev zstd wget libfl-dev python3 libarchive-tools gcc-aarch64-linux-gnu g++-aarch64-linux-gnu ccache lld clang
+        # download prebuilt clang (kept for compatibility with Android toolchain expectations)
+        mkdir -p clang
         curl -RLO https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/508ea7dd0d8f681904d0422e98af9613aaabf180/clang-r574158.tar.gz
         tar -C clang/ -xf clang-r574158.tar.gz
+        # make sure the clang bin dir is recorded
         echo "tools-folder=$(pwd)" >> $GITHUB_OUTPUT
       working-directory: ${{ steps.workspace.outputs.workspace-folder }}
       id: tools
@@ -78,16 +81,49 @@ jobs:
     - name: Build kernel
       run: |
         set -eo pipefail
+
         export CLANGDIR="${{ steps.tools.outputs.tools-folder }}/clang"
         export KERNEL_DIR="${{ steps.kernel.outputs.kernel-folder }}"
         export OUT_DIR="${KERNEL_DIR}/out"
         mkdir -p "${OUT_DIR}"
-
         rm -f "${OUT_DIR}/compile.log"
+
+        # always copy compile.log back even on failure
         trap 'cp -f "${OUT_DIR}/compile.log" $GITHUB_WORKSPACE/ || true' EXIT
 
+        export KBUILD_BUILD_USER="builder"
+        export KBUILD_BUILD_HOST="dhamarar"
+        export USE_CCACHE=1
+        export PATH="$CLANGDIR/bin:$PATH"
+        export KCFLAGS="$KCFLAGS -Wno-default-const-init-field-unsafe"
+
+        # JOBS control
         JOBS="${{ github.event.inputs.JOBS }}"
         if ! [[ "$JOBS" =~ ^[0-9]+$ ]]; then JOBS=2; fi
+
+        # relax stack size & ccache
+        ulimit -s unlimited || true
+        if command -v ccache >/dev/null 2>&1; then ccache -M 50G || true; fi
+
+        # Ensure ld.lld exists for the linker step
+        if ! command -v ld.lld >/dev/null 2>&1; then
+          echo "ld.lld not in PATH — attempting to find it in clang toolchain..."
+          if [ -x "$CLANGDIR/bin/ld.lld" ]; then
+            echo "Found ld.lld in $CLANGDIR/bin — creating symlink to /usr/bin/ld.lld (requires sudo)"
+            sudo ln -sf "$CLANGDIR/bin/ld.lld" /usr/bin/ld.lld || true
+          else
+            echo "ld.lld not found in clang toolchain; attempting to use system lld (installed via apt)."
+            # If apt-installed lld exists under versioned name, symlink it
+            for v in 17 16 15 14 13 12 11; do
+              if [ -x "/usr/bin/ld.lld-$v" ]; then
+                sudo ln -sf "/usr/bin/ld.lld-$v" /usr/bin/ld.lld || true
+                break
+              fi
+            done
+          fi
+        fi
+
+        echo "ld.lld path: $(command -v ld.lld || echo 'not found')"
 
         cd "${KERNEL_DIR}"
 
@@ -100,10 +136,17 @@ jobs:
         fi
 
         echo "Using defconfig target: $DEF_TARGET"
+        echo "Make jobs: $JOBS"
+        echo "Kernel out dir: $OUT_DIR"
 
-        make O=out ARCH=arm64 "$DEF_TARGET" 2>&1 | tee -a "${OUT_DIR}/compile.log"
+        # generate defconfig; tee to log
+        if ! make O=out ARCH=arm64 "${DEF_TARGET}" 2>&1 | tee -a "${OUT_DIR}/compile.log"; then
+          echo "ERROR: generating defconfig failed — lihat compile.log (uploaded as artifact)." >&2
+          exit 2
+        fi
 
-        make -j"$JOBS" O=out LLVM=1 LLVM_IAS=1 \
+        # build with controlled parallelism; tee to log
+        if ! make -j"$JOBS" O=out LLVM=1 LLVM_IAS=1 \
            ARCH=arm64 \
            CC=clang \
            LD=ld.lld \
@@ -120,9 +163,26 @@ jobs:
            HOSTLD=ld.lld \
            CROSS_COMPILE=aarch64-linux-gnu- \
            CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
-           2>&1 | tee -a "${OUT_DIR}/compile.log"
+           2>&1 | tee -a "${OUT_DIR}/compile.log"; then
 
-        echo "elapsed_time=$(echo "$(date +%s)"-"${{ steps.workspace.outputs.start_time }}" | bc)" >> $GITHUB_OUTPUT
+          BUILD_EXIT=$?
+          echo "BUILD FAILED with exit code ${BUILD_EXIT}" >&2
+
+          echo "===== TAIL compile.log (last 200 lines) ====="
+          tail -n 200 "${OUT_DIR}/compile.log" || true
+          echo "============================================="
+
+          if grep -i -E "killed|out of memory|oom" "${OUT_DIR}/compile.log" >/dev/null 2>&1; then
+            echo ""
+            echo "=== Detected possible out-of-memory (OOM) or killed process ==="
+            echo "Saran: kurangi jumlah JOBS menjadi 1 atau jalankan pada runner dengan RAM lebih besar."
+            echo ""
+          fi
+
+          exit "${BUILD_EXIT}"
+        fi
+
+        echo "elapsed_time=$(echo \"$(date +%s)\"-\"${{ steps.workspace.outputs.start_time }}\" | bc)" >> $GITHUB_OUTPUT
       working-directory: ${{ steps.kernel.outputs.kernel-folder }}
       id: build
 
@@ -159,3 +219,4 @@ jobs:
         path: |
           ${{ steps.kernel.outputs.kernel-folder }}/out/compile.log
           $GITHUB_WORKSPACE/compile.log
+        compression-level: 0
