@@ -1,4 +1,4 @@
-name: Kernel Build
+name: Kernel Build (multi-toolchain only)
 
 on:
   workflow_dispatch:
@@ -6,25 +6,95 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    env:
+      ARCH: arm64
+      O: out
+      DEFCONFIG: whyred_defconfig
+      IMAGE_NAME: Image.gz-dtb
+
     steps:
     - name: Checkout kernel source
       uses: actions/checkout@v4
-      
-    - name: Android kernel build
-      uses: lemniskett/android-kernel-actions@master
-      id: build
-      env:
-        NAME: RezzzzFy
-      with:
-        arch: arm64
-        compiler: clang/14
-        defconfig: gki_defconfig
-        image: Image.gz-dtb
 
-    - name: Upload Kernel and Module
+    - name: Install build dependencies & cross toolchains
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends \
+          build-essential bc bison flex libssl-dev dwarves \
+          make git ccache curl unzip rsync \
+          gcc-12-aarch64-linux-gnu gcc-11-aarch64-linux-gnu clang lld
+
+    - name: Try build with multiple toolchains (sequential)
+      id: try_build
+      run: |
+        set -euo pipefail
+        mkdir -p build_artifacts
+
+        COMPILERS=("gcc-12" "gcc-11" "clang")
+        NJOBS=$(( $(nproc) + 1 ))
+
+        try_make () {
+          echo "Running: make ARCH=${ARCH} O=${O} $*"
+          if make ARCH=${ARCH} O=${O} "$@"; then
+            return 0
+          else
+            return 1
+          fi
+        }
+
+        rm -rf ${O}
+        echo "Preparing defconfig (${DEFCONFIG})"
+        make ARCH=${ARCH} O=${O} ${DEFCONFIG}
+
+        SUCCESS=0
+        for C in "${COMPILERS[@]}"; do
+          echo "================================================="
+          echo "Trying toolchain: ${C}"
+          unset CROSS_COMPILE CC HOSTCC
+          export PATH="/usr/bin:$PATH"
+
+          if [[ "${C}" == gcc-* ]]; then
+            export CROSS_COMPILE="aarch64-linux-gnu-"
+            if try_make -j${NJOBS} ${IMAGE_NAME}; then
+              SUCCESS=1
+              USED_COMPILER="${C}"
+              break
+            fi
+          elif [[ "${C}" == "clang" ]]; then
+            export CC=clang
+            export CROSS_COMPILE="aarch64-linux-gnu-"
+            if try_make -j${NJOBS} ${IMAGE_NAME}; then
+              SUCCESS=1
+              USED_COMPILER="${C}"
+              break
+            fi
+            export LD=ld.lld
+            if try_make -j${NJOBS} ${IMAGE_NAME}; then
+              SUCCESS=1
+              USED_COMPILER="${C}-lld"
+              break
+            fi
+          fi
+
+          echo "Build failed with ${C}, cleaning..."
+          rm -rf ${O}
+          make ARCH=${ARCH} O=${O} ${DEFCONFIG}
+        done
+
+        if [[ "${SUCCESS}" -eq 1 ]]; then
+          echo "=== BUILD SUCCESS with ${USED_COMPILER} ==="
+          mkdir -p build_artifacts
+          cp ${O}/${IMAGE_NAME} build_artifacts/ || true
+          cp ${O}/arch/arm64/boot/Image* build_artifacts/ 2>/dev/null || true
+        else
+          echo "=== ALL TOOLCHAINS FAILED ==="
+          exit 1
+        fi
+
+        echo "::set-output name=artifact_dir::build_artifacts"
+
+    - name: Upload Kernel
       uses: actions/upload-artifact@v4
       with:
-        name: moduleandkernel
-        path: |
-          ${{ steps.build.outputs.outfile }}
-          ./out/drivers/memkernel/memkernel.ko
+        name: kernel_output
+        path: build_artifacts/**
