@@ -1,159 +1,30 @@
-name: Kernel Build 4.19
+name: Kernel Build
 
 on:
   workflow_dispatch:
-    inputs:
-      DEVICE:
-        description: 'Device'
-        default: Whyred
-        required: true
-      KERNEL_SOURCE:
-        description: 'Kernel Source (git url)'
-        default: https://github.com/mizukiKu/whyred_4.19.157.git
-        required: true
-      KERNEL_SOURCE_BRANCH:
-        description: 'Kernel Source Branch'
-        required: true
-      DEFCONFIG:
-        description: 'defconfig (basename only: whyred / whyred_defconfig)'
-        required: true
-      JOBS:
-        description: 'make -j jobs (reduce if OOM)'
-        required: false
-        default: '2'
 
 jobs:
   build:
-    if: github.event.repository.owner.id == github.event.sender.id
-    runs-on: ubuntu-22.04
-    permissions:
-      contents: write
-
+    runs-on: ubuntu-latest
     steps:
-
-    - name: Display Inputs
-      run: |
-        echo "::group::User Inputs"
-        echo "Device: ${{ github.event.inputs.DEVICE }}"
-        echo "Kernel Source: ${{ github.event.inputs.KERNEL_SOURCE }}"
-        echo "Branch: ${{ github.event.inputs.KERNEL_SOURCE_BRANCH }}"
-        echo "Defconfig: ${{ github.event.inputs.DEFCONFIG }}"
-        echo "Make Jobs: ${{ github.event.inputs.JOBS }}"
-        echo "::endgroup::"
-
-    - name: Initialize workspace
-      run: |
-        mkdir workspace
-        cd workspace
-        echo "workspace-folder=$(pwd)" >> $GITHUB_OUTPUT
-        echo "start_time=$(date +%s)" >> $GITHUB_OUTPUT
-      id: workspace
-
-    - name: Install dependencies (includes lld fix)
-      run: |
-        sudo apt update -y
-        sudo apt-get install -y bc flex curl git zip libncurses5 libssl-dev zstd wget libfl-dev python3 libarchive-tools gcc-aarch64-linux-gnu g++-aarch64-linux-gnu ccache lld clang
-        mkdir -p clang
-        curl -RLO https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/508ea7dd0d8f681904d0422e98af9613aaabf180/clang-r574158.tar.gz
-        tar -C clang/ -xf clang-r574158.tar.gz
-        echo "tools-folder=$(pwd)" >> $GITHUB_OUTPUT
-      working-directory: ${{ steps.workspace.outputs.workspace-folder }}
-      id: tools
-
-    - name: Clone kernel source
-      run: |
-        git clone --depth=1 \
-        ${{ github.event.inputs.KERNEL_SOURCE }} \
-        -b ${{ github.event.inputs.KERNEL_SOURCE_BRANCH }} \
-        kernel_tree
-
-        echo "kernel-folder=$(pwd)/kernel_tree" >> $GITHUB_OUTPUT
-      working-directory: ${{ steps.workspace.outputs.workspace-folder }}
-      id: kernel
-
-    - name: Build kernel
-      run: |
-        set -eo pipefail
-
-        export CLANGDIR="${{ steps.tools.outputs.tools-folder }}/clang"
-        export KERNEL_DIR="${{ steps.kernel.outputs.kernel-folder }}"
-        export OUT_DIR="${KERNEL_DIR}/out"
-
-        mkdir -p "${OUT_DIR}"
-        rm -f "${OUT_DIR}/compile.log"
-
-        trap 'cp -f "${OUT_DIR}/compile.log" $GITHUB_WORKSPACE/ || true' EXIT
-
-        export PATH="$CLANGDIR/bin:$PATH"
-
-        JOBS="${{ github.event.inputs.JOBS }}"
-        if ! [[ "$JOBS" =~ ^[0-9]+$ ]]; then JOBS=2; fi
-
-        ulimit -s unlimited || true
-        if command -v ccache >/dev/null 2>&1; then
-          ccache -M 50G || true
-        fi
-
-        # Ensure ld.lld exists
-        if ! command -v ld.lld >/dev/null 2>&1; then
-          if [ -x "$CLANGDIR/bin/ld.lld" ]; then
-            sudo ln -sf "$CLANGDIR/bin/ld.lld" /usr/bin/ld.lld
-          else
-            for v in 17 16 15 14 13 12 11; do
-              if [ -x "/usr/bin/ld.lld-$v" ]; then
-                sudo ln -sf "/usr/bin/ld.lld-$v" /usr/bin/ld.lld
-                break
-              fi
-            done
-          fi
-        fi
-
-        echo "ld.lld path: $(command -v ld.lld || echo missing)"
-
-        cd "${KERNEL_DIR}"
-
-        INPUT_DEF="${{ github.event.inputs.DEFCONFIG }}"
-        NORMALIZED_DEF="$(echo "$INPUT_DEF" | sed -E 's/_?defconfig$//')"
-        if [ -z "$NORMALIZED_DEF" ]; then
-          DEF_TARGET="defconfig_defconfig"
-        else
-          DEF_TARGET="${NORMALIZED_DEF}_defconfig"
-        fi
-
-        echo "Using defconfig target: $DEF_TARGET"
-
-        make O=out ARCH=arm64 "$DEF_TARGET" \
-        2>&1 | tee -a "${OUT_DIR}/compile.log"
-
-        make -j"$JOBS" O=out LLVM=1 LLVM_IAS=1 \
-           ARCH=arm64 \
-           CC=clang \
-           LD=ld.lld \
-           AR=llvm-ar \
-           AS=llvm-as \
-           NM=llvm-nm \
-           STRIP=llvm-strip \
-           OBJCOPY=llvm-objcopy \
-           OBJDUMP=llvm-objdump \
-           READELF=llvm-readelf \
-           HOSTCC=clang \
-           HOSTCXX=clang++ \
-           HOSTAR=llvm-ar \
-           HOSTLD=ld.lld \
-           CROSS_COMPILE=aarch64-linux-gnu- \
-           CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
-           2>&1 | tee -a "${OUT_DIR}/compile.log"
-
-        echo "elapsed_time=$(echo \"$(date +%s)\" - \"${{ steps.workspace.outputs.start_time }}\" | bc)" >> $GITHUB_OUTPUT
-      working-directory: ${{ steps.kernel.outputs.kernel-folder }}
+    - name: Checkout kernel source
+      uses: actions/checkout@v4
+      
+    - name: Android kernel build
+      uses: lemniskett/android-kernel-actions@master
       id: build
+      env:
+        NAME: RezzzzFy
+      with:
+        arch: arm64
+        compiler: clang/14
+        defconfig: gki_defconfig
+        image: Image.gz-dtb
 
-    - name: Upload Build Log
-      if: always()
+    - name: Upload Kernel and Module
       uses: actions/upload-artifact@v4
       with:
-        name: compile.log
+        name: moduleandkernel
         path: |
-          ${{ steps.kernel.outputs.kernel-folder }}/out/compile.log
-          $GITHUB_WORKSPACE/compile.log
-        compression-level: 0
+          ${{ steps.build.outputs.outfile }}
+          ./out/drivers/memkernel/memkernel.ko
